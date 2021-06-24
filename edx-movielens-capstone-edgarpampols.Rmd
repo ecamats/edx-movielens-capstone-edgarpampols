@@ -1,0 +1,1355 @@
+---
+title: 'HarvardX PH125.9x Data Science: Capstone - MovieLens Project'
+author: "Edgar Pampols"
+date: "6/23/2021"
+output:
+  pdf_document: 
+    number_sections: yes
+    toc: yes
+  html_document: default
+---
+
+```{r setup, fig.align='center',include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+\newpage
+
+# Summary
+
+This report is written within the frame of the "HarvardX - PH125.9x Data Science - Capstone" course. A dataset and some initial code to prepare is provided with the course materials, basically generating one dataset for model evaluation (named "edx") and one separate partition (named "validation", or final hold-out test set), the last one must be only used to compute the result of a final chosen model, and not for training, tuning or choosing models.
+
+The aim of the project is to build on top of the course materials to create a model that predicts user's ratings for movies with the maximum possible precision. The project sets a target of RMSE < 0.86490.
+
+The sequence of this project will consist on i) exploring different models, ii) evaluate them using the "edx" partition uniquely, iii) then decide for a final model and evaluate its performance on the "validation" set. To compare the different performance of the models, as well as computing the final result, a Residual Mean Square Error (RMSE) function will be used.
+
+After some initial exploration of the data properties, and the construction of basic models based on the course material, further additional effects and regularization techniques have been incorporated.
+
+The final selected model, in this report (named "Model 5") incorporates a combination of effects (movie, user, genre, age, hour and weekday effects), it was trained on the "edx" data partition alone and regularization technique was applied using cross-validation to tune parameter $\lambda$:
+$$ \hat{Y} = \mu + b_{i,\lambda} + b_{u,\lambda} + + b_{g,\lambda}+ b_{a,\lambda}+ b_{h,\lambda}+ b_{d,\lambda} \; \; \; with \; \lambda = 4.75$$
+The final RMSE obtained in this project when running the final model on the validation resulted in \underline{0.8644685} which satisfactorily achieves the project target of RMSE < 0.86490. This result has been achieved by applying techniques from the course.
+
+As an additional analysis beyond the scope of the course, a complementary analysis using "recosystem" (a Matrix Factorization package) has been performed and demonstrated an even lower RMSE of 0.7822679 but this will require very long computing resources.
+
+# Data Loading, Preparation and Exploratory analysis
+
+## Initial data loading as per the project instructions
+
+All the raw data for this project can be found in the following URL:
+
+http://files.grouplens.org/datasets/movielens/ml-10m.zip
+
+```{r , echo=FALSE, include=FALSE, warning=FALSE, message=FALSE}
+##########################################################
+# Create edx set, validation set (final hold-out test set)
+##########################################################
+
+# Note: this process could take a couple of minutes
+
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(data.table)) install.packages("data.table", repos = "http://cran.us.r-project.org")
+if(!require(dplyr)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(stringr)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(lubridate)) install.packages("data.table", repos = "http://cran.us.r-project.org")
+if(!require(recosystem)) install.packages("recosystem", repos = "http://cran.us.r-project.org")
+
+# Added some extra useful libraries to the pre-given code
+
+library(tidyverse)
+library(caret)
+library(data.table)
+library(dplyr)
+library(stringr)
+library(lubridate)
+library(recosystem)
+
+# MovieLens 10M dataset:
+# https://grouplens.org/datasets/movielens/10m/
+# http://files.grouplens.org/datasets/movielens/ml-10m.zip
+
+dl <- tempfile()
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings <- fread(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                 col.names = c("userId", "movieId", "rating", "timestamp"))
+
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+
+# if using R 4.0 or later:
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(movieId),
+                                           title = as.character(title),
+                                           genres = as.character(genres))
+
+movielens <- left_join(ratings, movies, by = "movieId")
+
+# Validation set will be 10% of MovieLens data
+set.seed(1, sample.kind="Rounding") # if using R 3.5 or earlier, use `set.seed(1)`
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+# Make sure userId and movieId in validation set are also in edx set
+validation <- temp %>% 
+  semi_join(edx, by = "movieId") %>%
+  semi_join(edx, by = "userId")
+
+# Add rows removed from validation set back into edx set
+removed <- anti_join(temp, validation)
+edx <- rbind(edx, removed)
+
+# We are left with to main sets edx set and validation set
+
+rm(dl, ratings, movies, test_index, temp, movielens, removed)
+```
+
+After executing the provided code, the two initial datasets "edx" and "validation" are obtained.
+
+Here's an example of the data structure of the "edx" set:
+
+```{r , echo=FALSE, include=TRUE, warning=FALSE, message=FALSE}
+head(edx,3)
+```
+Basically each record represent a movie rating associated to a user, with a timestamp and a movie identification number. The movie title together with movie year release are also included in the last field, as well as the movie genre or combination of genres.
+
+The rating given from a given user to a given movie in a given time, ranges from 0.5 to 5.0.
+
+The "validation" set will have similar structure, but will be kept unaltered until final results check.
+
+## Further data preparation 
+
+In order to easily evaluate RMSE for the different models, comparing predictions and test data, an RMSE function is defined as follows:
+$$ RMSE = \sqrt{\frac{1}{N}\displaystyle\sum_{u,i} (\hat{y}_{u,i}-y_{u,i})^{2}} $$
+
+```{r, echo = FALSE}
+##########################################################
+# Creation of RMSE function to facilitate RMSE calculation
+##########################################################
+```
+```{r, echo = TRUE, include = TRUE}
+RMSE <- function(true_ratings, predicted_ratings){
+  sqrt(mean((true_ratings - predicted_ratings)^2))
+}
+```
+```{r, echo = FALSE, include = FALSE, message = FALSE, warning = FALSE}
+##########################################################
+# Some useful data fields creation and cleaning
+##########################################################
+
+#extracting movie release year from title and rating year from timestamp
+
+edx <- edx %>% mutate(rating_year = year(as.POSIXlt(timestamp, origin = "1970-01-01")),
+                      hour = hour(as.POSIXlt(timestamp, origin = "1970-01-01")),
+                      weekday = weekdays(as.POSIXlt(timestamp, origin = "1970-01-01")),
+                      movie_year = as.numeric(str_sub(title,-5,-2)),
+                      movie_age = (rating_year - movie_year))
+                      
+validation <- validation %>% mutate(rating_year = year(as.POSIXlt(timestamp, origin = "1970-01-01")),
+                                    hour = hour(as.POSIXlt(timestamp, origin = "1970-01-01")),
+                                    weekday = weekdays(as.POSIXlt(timestamp, origin = "1970-01-01")),
+                                    movie_year = as.numeric(str_sub(title,-5,-2)),
+                                    movie_age = (rating_year - movie_year))
+
+#validation set will be parked and only used once to obtain final RMSE after choosing a final model
+
+#separating the multiple genres information could turn useful for exploration or modeling
+
+edx_separated <- edx %>% separate_rows(genres,sep = "\\|")
+
+edx_split <- edx_separated %>% mutate(value = 1) %>% spread(genres, value , fill = 0)
+
+```
+
+Before getting into the modeling part, a few mutations and reformatting of the data have been done to ease the analysis.
+
+Converting the timestamp integer into year, weekday and hour of the rating:
+```{r , echo=FALSE, include=TRUE, warning=FALSE, message=FALSE}
+edx %>% select(timestamp, rating_year, weekday, hour) %>% head(3)
+```
+Extracting the movie year of release and calculating the age of the movie at the time of rating:
+```{r , echo=FALSE, include=TRUE, warning=FALSE, message=FALSE}
+edx %>% select(title, rating_year, movie_year, movie_age) %>% head(3)
+```
+Additionally, a version of "edx" with the genres column split into different genres has been created, when genres are combined, to have a better understanding of genres individual contribution.
+
+## Selected exploratory analysis
+```{r, echo=FALSE, include=FALSE}
+##########################################################
+# Exploratory analysis of the dataset
+##########################################################
+
+summary(edx)
+
+#total number of ratings in edx set
+
+n_ratings_total <- nrow(edx)
+
+#total number of unique users and movies
+
+unique_movies <- n_distinct(edx$movieId)
+unique_users <- n_distinct(edx$userId)
+
+# there are 20 differnt types of individual genres, of which Drama Comedy and Thriller are the top genres
+
+n_distinct(edx_separated$genres)
+
+mean(edx$rating)
+
+n_ratings_total / unique_users
+
+n_ratings_total / unique_movies
+
+pure_genres_label <- edx_separated %>% group_by(genres) %>% summarize(n=n()) %>% arrange(desc(n))
+pure_genres_label <- as.vector(pure_genres_label$genres)
+```
+The working dataset "edx" contains a total of ~9 million rows each corresponding to one rating. The data contains ~10,000 unique movies, ~70,000 unique users, ~700 unique combinations of genres, formed by 20 individual genre categories. The mean of a movie rating of out of 5 is ~3.5, with an average of ~130 ratings per user, and ~850 ratings per movie.
+
+The most predominant individual genres among ratings are Drama and Comedy.
+```{r, echo=FALSE, fig.align='center', out.width = "75%",warning=FALSE, message=FALSE}
+#drama, comedy and thriller among the most used genre tags
+
+edx_separated %>% group_by(genres) %>% summarize(n=n()) %>% filter(genres != 'NA') %>% 
+  arrange(desc(n)) %>% ggplot(aes(x=reorder(genres,n), y=n)) + 
+  geom_col() + coord_flip() + xlab("Number of ratings") + ylab("Movie (individual) genres")
+```
+```{r, echo=FALSE, fig.align='center', out.width = "75%", include=FALSE, warning=FALSE, message=FALSE}
+#top_20 genre labels including "pure" and combined labels
+
+edx %>% group_by(genres) %>% summarize(n = n()) %>% filter(genres != 'NA') %>% 
+  top_n(20,n) %>% ggplot(aes(x=reorder(genres,n), y=n)) + 
+  geom_col() + coord_flip() + xlab("Number of ratings") + ylab("Movie genres")
+
+#Drama, Comedy, Comedy|Drama and Horror are the most frequently rated genres
+```
+The full rounded figures (as in "x.0") seem to be preferably assigned by users to movies as opposed to give half ratings (as in "x.5").
+```{r, echo=FALSE, fig.align='center', out.width = "75%",warning=FALSE, message=FALSE}
+#observing ratings distribution: full figure ratings x.0 are more common than x.5 ratings
+
+edx %>%
+  group_by(rating) %>%
+  summarize(count = n()) %>%
+  ggplot(aes(x = rating, y = count)) +
+  geom_col() + xlab("Rating") + ylab("Number of ratings")
+```
+While an average of ~130 ratings per user is observed, most of them submitted much less ratings and a few contributed with up to thousand ratings.
+```{r, echo=FALSE, fig.align='center', out.width = "75%",warning=FALSE, message=FALSE}
+#observing number of ratings per user distribution: 128 ratings per users but some are more active than others
+
+edx %>% group_by(userId) %>%
+  summarize(n_ratings = n()) %>%
+  ggplot(aes(x=n_ratings, y=..count..)) + 
+  geom_histogram() + 
+  scale_x_log10() + xlab("Ratings per user") + ylab("Count of users")
+```
+Similarly, certain movies have accumulated much more ratings than others.
+```{r, echo=FALSE, fig.align='center', out.width = "75%", warning=FALSE, message=FALSE}
+#observing number of ratings per movie distribution: 842 ratings per movie but some are more rated than others
+
+edx %>% group_by(movieId) %>%
+  summarize(n_ratings = n()) %>%
+  ggplot(aes(x=n_ratings, y=..count..)) + 
+  geom_histogram() + 
+  scale_x_log10()  + xlab("Ratings per movie") + ylab("Count of movies")
+```
+Both the amount of ratings and the mix of genres evolves and changes over the years.
+```{r, echo=FALSE, fig.align='center',out.width = "85%", warning=FALSE, message=FALSE}
+#genres contribution by year: based on every pure gender incidence
+
+edx_separated %>% filter(movie_year >= 1930) %>%
+  filter(genres %in% pure_genres_label) %>%
+  group_by(genres,movie_year) %>% summarize(n_movies = n()) %>%
+  ggplot(aes(x = movie_year,y = n_movies, fill = reorder(genres,-n_movies))) +
+  geom_bar(position="stack", stat="identity") + xlab("Movie release year") + ylab("Number of ratings") +
+  theme(legend.text = element_text(size=5),legend.key.size = unit(0.4, 'cm')) + labs(fill="Genres")
+```
+It is expected that different movies have different ratings, and this will be considered in the modelling phase. 
+
+However, the following plot shows differences in ratings between different genres combinations (the top 20 genre combinations by number of ratings are shown here), while the size of the bubbles reflects the number of ratings under each genre combination.
+
+By looking at Drama, Comedy and Comedy|Drama combination, it is observed that preserving the combined genres and treat them as an individual genres seems appropriate for the analysis. From this analysis it seems plausible to explore a "genre effect" approach while modeling in the next chapters.
+```{r, echo=FALSE, fig.align='center', out.width = "75%",warning=FALSE, message=FALSE}
+#exploring the average rating by genre
+
+edx %>% group_by(genres) %>% filter(genres != 'NA' & genres != "IMAX") %>% 
+  summarize(rating = mean(rating), n = n()) %>% top_n(20,n) %>%
+  ggplot(aes(x = reorder(genres,rating), size = n, y = rating)) + geom_point() + coord_flip() +
+  xlab("Rating") + ylab("Top 20 genre combinations") + labs(size = "Number of ratings")
+```
+The following exploratory views, illustrate deviations in rating by different variables other than the movies themselves.
+
+Here's a view of how the average rating has evolved across the year the rating was created.
+```{r, echo=FALSE, fig.align='center', out.width = "75%", warning=FALSE, message=FALSE}
+#average rating trend through the year the ratings where generated
+
+edx %>% group_by(rating_year) %>%
+  summarize(rating = mean(rating)) %>%
+  ggplot(aes(rating_year, rating)) +
+  geom_point() +
+  geom_smooth()
+```
+Similarly, the following of average rating by the year the movie was released suggests that older movies get higher ratings.
+```{r, echo=FALSE, fig.align='center',out.width = "75%",warning=FALSE, message=FALSE}
+#average rating trend through the year the movie was released
+
+edx %>% group_by(movie_year) %>%
+  summarize(rating = mean(rating)) %>%
+  ggplot(aes(movie_year, rating)) +
+  geom_point() +
+  geom_smooth()
+```
+Combining the previous views to compute the age of the movie by the year the ratings was generated shows how old movies (for example more than 50 years old) get higher ratings, except for extremely old ones (more than 75 years old).
+```{r, echo=FALSE, fig.align='center',out.width = "75%",warning=FALSE, message=FALSE}
+#average rating depending on how old the movie was at time of rating
+
+edx %>% mutate(movie_age = rating_year - movie_year) %>% filter (rating_year >= movie_year) %>%
+  group_by(movie_age) %>% summarize(rating = mean(rating), n = n()) %>%
+  ggplot(aes(movie_age, rating)) + geom_point() + geom_smooth()
+
+#only in instances were the movies are quite old ratings seem to be clearly higher
+```
+There seems to be a relatively smooth variation in ratings depending on what time of the day the rating was generated, with evening and night times leading to higher ratings.
+```{r, echo=FALSE, fig.align='center',out.width = "75%",warning=FALSE, message=FALSE}
+#exploring a few other parameters linked to rating time for example weekday or hour
+
+edx %>% group_by(hour) %>% summarize(rating = mean(rating), n = n()) %>%
+  ggplot(aes(hour, rating)) + geom_point() + geom_smooth()
+
+#evenings and nighttime seem to generate higher ratings
+```
+Similarly, ratings generated on weekend days result into higher evaluations.
+```{r, echo=FALSE, fig.align='center',out.width = "75%",warning=FALSE, message=FALSE}
+weekday_avgs <- edx %>% group_by(weekday) %>% summarize(rating = mean(rating), n = n())
+
+weekday_avgs$weekday <- factor(weekday_avgs$weekday, levels = c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"))
+
+weekday_avgs %>% ggplot(aes(weekday, rating)) + geom_point()
+
+#rating levels higher on the weekend and decrease over the week
+```
+The variations in rating are not very relevant, but all these effects combined can help make the model more precise. One practical point to consider will be the frequency in refreshing the model (i.e. daily, weekly or real-time) depending on which the time of day or the day of the week the rating is generated can play a role or not.
+
+# First set of basic models
+
+```{r, echo=FALSE, include=FALSE}
+##########################################################
+# Preparation of training and test split from edx partition
+##########################################################
+```
+Before starting any model development and comparison, it is required to repartition the "edx" data set into a training and a testing subsets, the following code is used for that purpose:
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+# Test set will be 10% of edx and train set will be the remining
+test_index <- createDataPartition(y = edx$rating, times = 1, p = 0.1, list = FALSE)
+
+train_temp <- edx[-test_index,]
+test_temp <- edx[test_index,]
+
+# Making sure userId and movieId in test set are also in training set
+test_edx <- test_temp %>% semi_join(train_temp, by = 'movieId') %>%
+  semi_join(train_temp, by = 'userId')
+
+removed <- anti_join(test_temp, test_edx)
+train_edx <- rbind(train_temp, removed)
+```
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+# We are left with two main sets train_edx set and test_edx
+
+rm(train_temp, test_temp, removed)
+```
+This is a crucial step in model development and a key requirement for the project submission.
+
+## Development of basic models
+```{r, echo=FALSE, include=FALSE}
+##########################################################
+# First set of different simple models
+##########################################################
+
+#MODEL 0 --> simply using the average rating as a prediction as base model
+
+mu <- mean(train_edx$rating)
+
+model_0_rmse <- RMSE(mu, test_edx$rating)
+model_0_rmse
+rmse_results <- data_frame(method = "Model 0: Just the average", RMSE = model_0_rmse)
+```
+A simple model based on assigning the rating average to all the ratings is built and evaluated as a first reference. 
+$$ \hat{Y} = \mu $$
+Below is the RMSE of "Model 0" where the ratings prediction is missed by more than one star.
+```{r, echo=FALSE, eval=TRUE,warning=FALSE,message=FALSE}
+rmse_results %>% knitr::kable()
+
+#we are missing the rating by more than one star
+```
+The next are models to evaluate the stand-alone effect of different variables. The predicted rating is improved by adding or subtracting a particular variable effect from $\mu$. Here's an example of "Model 1a: Movie Effect alone" with its simple code and an illustration of the effect of $b_{i}$ over $\mu$:
+$$ \hat{Y} = \mu + b_{i}$$
+```{r, echo=TRUE, fig.align='center',out.width = "75%",warning=FALSE,message=FALSE}
+#MODEL 1a --> factoring for the movie effect alone
+
+movie_avgs <- train_edx %>% 
+  group_by(movieId) %>% 
+  summarize(b_i = mean(rating - mu))
+```
+```{r, echo=FALSE, fig.align='center',out.width = "75%",warning=FALSE,message=FALSE}
+movie_avgs %>% qplot(b_i, geom ="histogram", bins = 10, data = ., color = I("black"))
+```
+```{r, echo=TRUE, fig.align='center',out.width = "75%",warning=FALSE,message=FALSE}
+predicted_ratings <- mu + test_edx %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  .$b_i
+```
+The same approach with identical code adapted to each variable, will be used to evaluate other variable effects such as gender, hour, user, age of the movie or weekday. For which the following RMSE results are obtained:
+```{r, echo=FALSE, eval=TRUE, include=FALSE}
+model_1a_rmse <- RMSE(predicted_ratings, test_edx$rating)
+model_1a_rmse
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(method="Model 1a: Movie Effect alone Model",
+                                     RMSE = model_1a_rmse ))
+
+rmse_results %>% knitr::kable()
+
+#results are below one star deviation from the correct rating
+
+
+#MODEL 1b --> factoring for the user effect alone
+
+user_avgs <- train_edx %>% 
+  group_by(userId) %>% 
+  summarize(b_u = mean(rating - mu))
+
+user_avgs %>% qplot(b_u, geom ="histogram", bins = 10, data = ., color = I("black"))
+
+predicted_ratings <- mu + test_edx %>% 
+  left_join(user_avgs, by='userId') %>%
+  .$b_u
+
+model_1b_rmse <- RMSE(predicted_ratings, test_edx$rating)
+model_1b_rmse
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(method="Model 1b: User Effect alone Model",
+                                     RMSE = model_1b_rmse ))
+
+rmse_results %>% knitr::kable()
+
+#results are below one star difference but looks like movie effect improves better our model
+
+#MODEL 1c --> factoring for the hour of rating effect
+
+hour_avgs <- train_edx %>% 
+  group_by(hour) %>% 
+  summarize(b_h = mean(rating - mu))
+
+hour_avgs %>% qplot(b_h, geom ="histogram", bins = 10, data = ., color = I("black"))
+
+predicted_ratings <- mu + test_edx %>% 
+  left_join(hour_avgs, by='hour') %>%
+  .$b_h
+
+model_1c_rmse <- RMSE(predicted_ratings, test_edx$rating)
+model_1c_rmse
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(method="Model 1c: Hour Effect alone Model",
+                                     RMSE = model_1c_rmse ))
+
+rmse_results %>% knitr::kable()
+
+#MODEL 1d --> factoring for the age of the movie at rating time effect
+
+age_avgs <- train_edx %>% 
+  group_by(movie_age) %>% 
+  summarize(b_a = mean(rating - mu))
+
+age_avgs %>% qplot(b_a, geom ="histogram", bins = 10, data = ., color = I("black"))
+
+predicted_ratings <- mu + test_edx %>% 
+  left_join(age_avgs, by='movie_age') %>%
+  .$b_a
+
+model_1d_rmse <- RMSE(predicted_ratings, test_edx$rating)
+model_1d_rmse
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(method="Model 1d: Age Effect alone Model",
+                                     RMSE = model_1d_rmse ))
+
+rmse_results %>% knitr::kable()
+
+#MODEL 1e --> factoring for the genre effect
+
+genre_avgs <- train_edx %>% 
+  group_by(genres) %>% 
+  summarize(b_g = mean(rating - mu))
+
+genre_avgs %>% qplot(b_g, geom ="histogram", bins = 10, data = ., color = I("black"))
+
+predicted_ratings <- mu + test_edx %>% 
+  left_join(genre_avgs, by='genres') %>%
+  .$b_g
+
+model_1e_rmse <- RMSE(predicted_ratings, test_edx$rating)
+model_1e_rmse
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(method="Model 1e: Genres Effect alone Model",
+                                     RMSE = model_1e_rmse ))
+```
+```{r, echo=FALSE, eval=TRUE,warning=FALSE,message=FALSE}
+rmse_results %>% knitr::kable()
+
+#genres effect performs better but far from movie effect, which makes sense because genre effect is contained in movie effect
+```
+Movie and user effects, followed by genre, are the variables that improve better the RMSE results. Age, hour and other tested effects drive some results but comparatively marginal.
+
+## Combining multiple effects
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+#MODEL 2a --> factoring for the user effect on top of movie effect
+
+#the user effect is calculated as the remining gap left after the mu and the movie effect
+```
+The following tests will involve combining multiple effects of the biases from different variables. The predicted rating is improved by further adding or subtracting additional effects. Here's an example of "Model 2a: User Effect on top of Movie Effect" with its code and an illustration of the effect of $b_{i}$ and $b_{u}$ over $\mu$:
+$$ \hat{Y} = \mu + b_{i} + b_{u}$$
+```{r, echo=TRUE, fig.align='center',out.width = "75%",warning=FALSE,message=FALSE}
+user_avgs <- train_edx %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  group_by(userId) %>% 
+  summarize(b_u = mean(rating - mu - b_i))
+```
+```{r, echo=FALSE, fig.align='center',out.width = "75%",warning=FALSE,message=FALSE}
+user_avgs %>% qplot(b_u, geom ="histogram", bins = 10, data = ., color = I("black"))
+```
+```{r, echo=TRUE, fig.align='center',out.width = "75%",warning=FALSE,message=FALSE}
+predicted_ratings <- test_edx %>% 
+  left_join(user_avgs, by='userId') %>%
+  left_join(movie_avgs, by='movieId') %>%
+  mutate(pred = mu + b_i + b_u) %>%
+  .$pred
+```
+Subsequently, additional effects can be modelized, in this case the order chosen has been based on the order of RMSE performance of each stand-alone model in previous section. As illustrated later, "Model 2a" performed better than "Model 2b", where the only difference was the order of the effects calculation.
+
+Here's an example of "Model 2c: Movie/User/Genre/Age/Hour/Day Effects" combining multiple effects:
+$$ \hat{Y} = \mu + b_{i} + b_{u} + + b_{g}+ b_{a}+ b_{h}+ b_{d}$$
+```{r, echo=FALSE, include=FALSE,warning=FALSE, message=FALSE}
+model_2a_rmse <- RMSE(predicted_ratings, test_edx$rating)
+model_2a_rmse
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(method="Model 2a: User Effect on top of Movie Effect",
+                                     RMSE = model_2a_rmse ))
+
+rmse_results %>% knitr::kable()
+
+#using user effect as the residual from the average minus the movie effect improves substantially the result
+
+test_edx %>% mutate(error = rating - predicted_ratings) %>% 
+  group_by(title) %>% summarize(n = n(), error = mean(error)) %>%
+  top_n(10,error)
+
+test_edx %>% mutate(error = rating - predicted_ratings) %>% 
+  group_by(title) %>% summarize(n = n(), error = mean(error)) %>%
+  top_n(-10,error)
+
+#as a strategy to improve this model, we observe that the responsibles for the largest errors are movies with very few ratings
+
+#MODEL 2b --> factoring for the movie effect on top of user effect (reverse order)
+
+#the user effect is calculated as the remaining gap left after the mu and the user effect
+
+user_avgs <- train_edx %>% 
+  group_by(userId) %>% 
+  summarize(b_u = mean(rating - mu))
+
+movie_avgs <- train_edx %>% 
+  left_join(user_avgs, by='userId') %>%
+  group_by(movieId) %>% 
+  summarize(b_i = mean(rating - mu - b_u))
+
+movie_avgs %>% qplot(b_i, geom ="histogram", bins = 10, data = ., color = I("black"))
+
+predicted_ratings <- test_edx %>% 
+  left_join(user_avgs, by='userId') %>%
+  left_join(movie_avgs, by='movieId') %>%
+  mutate(pred = mu + b_i + b_u) %>%
+  .$pred
+
+model_2b_rmse <- RMSE(predicted_ratings, test_edx$rating)
+model_2b_rmse
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(method="Model 2b: Movie Effect on top of User Effect",
+                                     RMSE = model_2b_rmse ))
+
+rmse_results %>% knitr::kable()
+
+#model 2a performs better using the movie effect as a basis then calculating user effect
+```
+```{r, echo=TRUE, fig.align='center',out.width = "75%",warning=FALSE,message=FALSE}
+#MODEL 2c --> factoring for the year, hour and day effect on top of movie and user effects
+
+#the effects are added in order of performance of the standalone models
+
+movie_avgs <- train_edx %>% 
+  group_by(movieId) %>% 
+  summarize(b_i = mean(rating - mu))
+
+user_avgs <- train_edx %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  group_by(userId) %>% 
+  summarize(b_u = mean(rating - mu - b_i))
+
+genre_avgs <- train_edx %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  group_by(genres) %>% 
+  summarize(b_g = mean(rating - mu - b_i - b_u))
+
+age_avgs <- train_edx %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  left_join(genre_avgs, by='genres') %>%
+  group_by(movie_age) %>% 
+  summarize(b_a = mean(rating - mu - b_i - b_u - b_g))
+
+hour_avgs <- train_edx %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  left_join(genre_avgs, by='genres') %>%
+  left_join(age_avgs, by='movie_age') %>%
+  group_by(hour) %>% 
+  summarize(b_h = mean(rating - mu - b_i - b_u - b_g - b_a))
+
+weekday_avgs <- train_edx %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  left_join(genre_avgs, by='genres') %>%
+  left_join(age_avgs, by='movie_age') %>%
+  left_join(hour_avgs, by='hour') %>%
+  group_by(weekday) %>% 
+  summarize(b_w = mean(rating - mu - b_i - b_u - b_g - b_a - b_h))
+
+predicted_ratings <- test_edx %>% 
+  left_join(user_avgs, by='userId') %>%
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(genre_avgs, by='genres') %>%
+  left_join(age_avgs, by='movie_age') %>%
+  left_join(hour_avgs, by='hour') %>%
+  left_join(weekday_avgs, by='weekday') %>%
+  mutate(pred = mu + b_i + b_u + b_g + b_a + b_h + b_w) %>%
+  .$pred
+```
+```{r, echo=FALSE, include=FALSE, warning=FALSE, message=FALSE}
+RMSE(predicted_ratings, test_edx$rating)
+
+model_2c_rmse <- RMSE(predicted_ratings, test_edx$rating)
+model_2c_rmse
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(method="Model 2c: Movie/User/Genre/Age/Hour/Day Effects",
+                                     RMSE = model_2c_rmse ))
+```
+Below are the RMSE results of the models developed so far, it is visible how combining effects improves rating prediction.
+```{r, echo=FALSE, fig.align='center',out.width = "75%",eval=TRUE,warning=FALSE,message=FALSE}
+rmse_results %>% knitr::kable()
+
+#the model marginally improves our previous best model with two effects
+```
+"Model 2c" is the best performing model among simple models, so far.
+```{r, echo=FALSE, fig.align='center',out.width = "75%",warning=FALSE,message=FALSE}
+rmse_results %>% ggplot(aes(x=reorder(method,RMSE), y=RMSE)) + 
+  geom_col() + coord_flip() + xlab("Method (by descending RMSE)")
+
+#we will now build on our best models to improve via regularization techniques
+```
+# Applying regularization
+
+While observing the largest errors from our last models (see tables below), they concentrate on movies that have very small number of ratings (i.e. 1 rating only). This observations act like noise to the predictions.
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+##########################################################
+# Applying regularization approach to previous models
+##########################################################
+
+test_edx %>% mutate(error = rating - predicted_ratings) %>% 
+  group_by(title) %>% summarize(n = n(), error = mean(error)) %>%
+  top_n(5,error)
+
+test_edx %>% mutate(error = rating - predicted_ratings) %>% 
+  group_by(title) %>% summarize(n = n(), error = mean(error)) %>%
+  top_n(-5,error)
+
+#as a strategy to improve last models, we observe that the responsibles for the largest errors are movies with very few reatings
+
+```
+## Regularization principles
+
+The general idea behind regularization is to constrain the total variability of the effect sizes and penalize instances were number of observations is very small by adding a parameter $\lambda$ to our models. For example, to improve the previously simple "Model 1a: Movie Effect alone Model" the values of the previous $b_{i}$ are recalculated as $b_{i,\lambda}$ like in the expression below: 
+$$
+b_i = \frac{1}{n_i} \sum_{u=1}^{n_i} \left(Y_{u,i} - \mu\right) \; \implies  \; b_{i,\lambda} = \frac{1}{\lambda + n_i} \sum_{u=1}^{n_i} \left(Y_{u,i} - \mu\right) \; \; \; with \; n_i \; number \; of \; ratings \; for \; movie \; i
+$$
+
+This approach will, when the sample size $n_i$ is very large, give a stable estimate, then the penalty $\lambda$ will effectively be ignored since $n_i+\lambda \approx n_i$. However, when the $n_i$ is small, then the estimate $\hat{b}_i(\lambda)$ is shrunken towards 0.
+
+## Preparation of k-fold cross-validation
+
+As the following models will require the tuning of external parameter(s) (i.e. $\lambda$) it is required to subset the previously used training data into $k$ partitions to use cross-validation. In the next iterations $k = 5$ will be used to reduce computing time.
+```{r, echo = TRUE}
+#preparation of cross-validation data partitions to tune regularization parameter
+
+nb_folds <- 5
+
+cv_folds <- createFolds(train_edx$rating, k = nb_folds, returnTrain = TRUE)
+```
+Each of the regularized models will be tuned using the "edx" test cross-validation partitions, then built on the entire "edx" training partition for more accuracy, and evaluated on the "edx" test partition for comparison (exact same test set as in the simple models in previous sections). The "validation" set will still not be used until a final model has been selected.
+
+Below is an example of how the code for "Model 3a: Movie Effect alone regularized" is tuned by looping across the different cross-validation sets and different ranges for $\lambda$ to select the optimal parameter value.
+```{r, echo=TRUE, fig.align='center',out.width = "75%",warning=FALSE,message=FALSE}
+#MODEL 3a --> applying regularization to movie effect
+
+l_min <- 1
+l_max <- 3
+l_steps <- 0.25
+
+rmse_matrix <- matrix(nrow=nb_folds,ncol=(l_max-l_min)/l_steps+1)
+lambdas <- seq(l_min, l_max, l_steps)
+
+for(k in 1:nb_folds) {
+  train_temp <- train_edx[cv_folds[[k]],]
+  test_temp <- train_edx[-cv_folds[[k]],]
+  
+  test_data <- test_temp %>% semi_join(train_temp, by = 'movieId') %>%
+    semi_join(train_temp, by = 'userId')
+  
+  removed <- anti_join(test_temp, test_data)
+  train_data <- rbind(train_temp, removed)
+  
+  mu <- mean(train_data$rating)
+  
+  just_the_sum <- train_data %>% group_by(movieId) %>%
+    summarize(s = sum(rating - mu), n_i = n())
+  
+  rmse_matrix[k,] <- sapply(lambdas, function(l){
+    predicted_ratings <- test_data %>% 
+      left_join(just_the_sum, by='movieId') %>% 
+      mutate(b_i = s/(n_i+l)) %>%
+      mutate(pred = mu + b_i) %>%
+      .$pred
+    
+  return(RMSE(predicted_ratings, test_data$rating))
+  })
+}
+
+rmses <- colMeans(rmse_matrix)
+lambda_best <- lambdas[which.min(rmses)]
+```
+The value for parameter $\lambda$ that optimizes the RMSE for this model is 2.25.
+```{r, echo=FALSE, include=TRUE, fig.align='center',out.width = "75%",warning=FALSE,message=FALSE}
+qplot(lambdas, rmses)
+```
+```{r, echo=FALSE, include=FALSE, fig.align='center',out.width = "75%",warning=FALSE,message=FALSE}
+lambda_best
+
+#lambda that optimizes the model is 2.25
+```
+The following code shows how the optimum $\lambda$ is used on the "edx" train set to build the model and subsequently evaluate it on the "edx" test partition.
+```{r, echo=TRUE, fig.align='center',out.width = "75%",warning=FALSE,message=FALSE}
+#build the model and test with edx test partition set
+
+mu <- mean(train_edx$rating)
+
+movie_avgs <- train_edx %>% 
+  group_by(movieId) %>% 
+  summarize(b_i = sum(rating - mu)/(n()+lambda_best), n_i = n())
+```
+```{r, echo=TRUE, fig.align='center',out.width = "75%",warning=FALSE,message=FALSE}
+predicted_ratings <- mu + test_edx %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  .$b_i
+```
+Note how the regularization now penalizes the $b_{i}$ values for the movies with very low number of ratings, making them converge towards zero, as appreciated in the below plot.
+```{r, echo=FALSE, include=TRUE, fig.align='center',out.width = "75%",warning=FALSE,message=FALSE}
+movie_avgs_ori <- train_edx %>% 
+  group_by(movieId) %>% 
+  summarize(b_i = mean(rating - mu))
+
+data_frame(original = movie_avgs_ori$b_i, 
+           regularlized = movie_avgs$b_i, 
+           n = movie_avgs$n_i) %>%
+  ggplot(aes(original, regularlized, size=sqrt(n))) + 
+  geom_point(shape=1, alpha=0.5) + xlab("Original b_i") + ylab("Regularized b_i") + labs(size="n_i")
+
+#the plot shows how the smaller the n_i's the more the b_i's shrink towards zero
+```
+
+```{r, echo = FALSE, include = FALSE}
+model_3a_rmse <- RMSE(predicted_ratings, test_edx$rating)
+model_3a_rmse
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(method="Model 3a: Movie Effect alone regularized",
+                                     RMSE = model_3a_rmse ))
+```
+```{r, echo = FALSE, eval=TRUE}
+rmse_results[c(2,10),] %>% knitr::kable()
+```
+The RMSE of "Model 3a: Movie Effect alone regularized" improves slightly compared to its non-regularized equivalent.
+```{r, echo=FALSE,include=FALSE}
+#initiating a small table to store lambda values
+
+lambda_results <- data_frame(method = "Model 3a: Lambda_i", Lambda = lambda_best)
+
+lambda_results %>% knitr::kable()
+
+#the results improves slightly vs the non-regularizer movie effect model alone
+```
+
+## Building on regularized models
+
+Based on the regularization technique illustrated above, a series of more evolved models have been tested, like adding additional effects to regularization, or testing the effect of adding separate customized $\lambda_i$ and $\lambda_u$ to see if RMSE improves compared to having the same $\lambda$ for each effect.
+
+The principle is to calculate the additional effects as follows (an example of user effect on top of movie effect is used here):
+$$
+b_{u,\lambda} = \frac{1}{\lambda + n_u} \sum_{u=1}^{n_u} \left(Y_{u,i} - \mu - b_{i,\lambda}\right)
+$$
+```{r, echo = FALSE,include=FALSE, fig.align='center',out.width = "75%",include = FALSE}
+#MODEL 3b --> applying regularization to both movie first then to user effect
+
+l_min <- 4
+l_max <- 6
+l_steps <- 0.25
+
+rmse_matrix <- matrix(nrow=nb_folds,ncol=(l_max-l_min)/l_steps+1)
+lambdas <- seq(l_min, l_max, l_steps)
+
+for(k in 1:nb_folds) {
+  
+  train_temp <- train_edx[cv_folds[[k]],]
+  test_temp <- train_edx[-cv_folds[[k]],]
+  
+  test_data <- test_temp %>% semi_join(train_temp, by = 'movieId') %>%
+    semi_join(train_temp, by = 'userId')
+  
+  removed <- anti_join(test_temp, test_data)
+  train_data <- rbind(train_temp, removed)
+  
+  mu <- mean(train_data$rating)
+
+  rmse_matrix[k,] <- sapply(lambdas, function(l){
+    movie_avgs <- train_data %>% group_by(movieId) %>%
+      summarize(b_i = sum(rating - mu)/(n()+l))
+    
+    user_avgs <- train_data %>% 
+      left_join(movie_avgs, by='movieId') %>%
+      group_by(userId) %>%
+      summarize(b_u = sum(rating - mu - b_i)/(n()+l))
+    
+    predicted_ratings <- test_data %>% 
+      left_join(movie_avgs, by='movieId') %>% 
+      left_join(user_avgs, by='userId') %>% 
+      mutate(pred = mu + b_i + b_u) %>%
+      .$pred
+    
+    return(RMSE(predicted_ratings, test_data$rating))
+  })
+  
+}
+
+rmses <- colMeans(rmse_matrix)
+
+qplot(lambdas, rmses)
+
+lambda_best <- lambdas[which.min(rmses)]
+lambda_best
+
+#lambda that optimizes the model is 4.75
+
+#build the model and test with the edx test set
+
+mu <- mean(train_edx$rating)
+
+movie_avgs <- train_edx %>% 
+  group_by(movieId) %>% 
+  summarize(b_i = sum(rating - mu)/(n()+lambda_best))
+
+user_avgs <- train_edx %>% 
+  left_join(movie_avgs, by = 'movieId') %>%
+  group_by(userId) %>% 
+  summarize(b_u = sum(rating - b_i - mu)/(n()+lambda_best))
+
+predicted_ratings <- test_edx %>% 
+  left_join(movie_avgs, by='movieId') %>% 
+  left_join(user_avgs, by='userId') %>% 
+  mutate(pred = mu + b_i + b_u) %>%
+  .$pred
+
+model_3b_rmse <- RMSE(predicted_ratings, test_edx$rating)
+model_3b_rmse
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(method="Model 3b: Movie then User Effect regularized",
+                                     RMSE = model_3b_rmse ))
+
+rmse_results %>% knitr::kable()
+
+lambda_results <- bind_rows(lambda_results,
+                            data_frame(method = "Model 3b: Lambda_i_u", Lambda = lambda_best))
+
+lambda_results %>% knitr::kable()
+
+#the model improves the non regularized model by 0.001
+
+#warning: this code can take a long time to run
+
+#MODEL 4 --> applying different lambdas to movie first then to user effects
+
+l_min <- 4.0
+l_max <- 6.0
+l_steps <- 0.25
+
+lambda_pairs <- gtools::permutations(length(seq(l_min, l_max, l_steps)), 2, seq(l_min, l_max, l_steps), repeats.allowed=TRUE)
+
+rmse_matrix <- matrix(nrow=nb_folds,ncol=nrow(lambda_pairs))
+
+index <- 1:nrow(lambda_pairs)
+
+for(k in 1:nb_folds) {
+  
+  train_temp <- train_edx[cv_folds[[k]],]
+  test_temp <- train_edx[-cv_folds[[k]],]
+  
+  test_data <- test_temp %>% semi_join(train_temp, by = 'movieId') %>%
+    semi_join(train_temp, by = 'userId')
+  
+  removed <- anti_join(test_temp, test_data)
+  train_data <- rbind(train_temp, removed)
+  
+  mu <- mean(train_data$rating)
+  
+  rmse_one_pair <- function(index, l){
+    lambda_i <- l[index,1]
+    lambda_u <- l[index,2]
+    
+    movie_avgs <- train_data %>% group_by(movieId) %>%
+      summarize(b_i = sum(rating - mu)/(n()+lambda_i))
+    
+    user_avgs <- train_data %>% 
+      left_join(movie_avgs, by='movieId') %>%
+      group_by(userId) %>%
+      summarize(b_u = sum(rating - mu - b_i)/(n()+lambda_u))
+    
+    predicted_ratings <- test_data %>% 
+      left_join(movie_avgs, by='movieId') %>% 
+      left_join(user_avgs, by='userId') %>% 
+      mutate(pred = mu + b_i + b_u) %>%
+      .$pred
+    
+    return(RMSE(predicted_ratings, test_data$rating))
+  }
+
+  rmse_matrix[k,] <- sapply(index, rmse_one_pair, l = lambda_pairs)
+  
+} 
+
+rmses <- colMeans(rmse_matrix)
+
+lambda_best <- lambda_pairs[which.min(rmses),]
+lambda_best
+```
+Attempting to regularize movie and user effect tuning different $\lambda$ values for movies and users, results in $\lambda_i$ and $\lambda_u$ with very close values to the optimal unique $\lambda$ value version.
+```{r, echo=FALSE, include=TRUE, fig.align='center',out.width = "75%",warning=FALSE,message=FALSE}
+lambda_plot <- data.frame(rmse = rmses, lambda_i = lambda_pairs[,1],lambda_u = lambda_pairs[,2])
+lambda_plot %>% ggplot(aes(x=lambda_i,y=lambda_u,fill=rmse, z=rmse))  + 
+  geom_raster(vjust=0.1,hjust=0.1) + scale_fill_gradient(trans = "log", low = "black", high = "white") + geom_contour()
+
+#lambdas that optimize the model are 4.25 for movies and 5.00 for users, very close to previous 4.75 figure
+```
+```{r, echo = FALSE,include=FALSE, include = FALSE}
+#build the model and test with edx test set
+
+mu <- mean(train_edx$rating)
+
+movie_avgs <- train_edx %>% group_by(movieId) %>%
+  summarize(b_i = sum(rating - mu)/(n()+lambda_best[1]))
+
+user_avgs <- train_edx %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  group_by(userId) %>%
+  summarize(b_u = sum(rating - mu - b_i)/(n()+lambda_best[2]))
+
+predicted_ratings <- test_edx %>% 
+  left_join(movie_avgs, by='movieId') %>% 
+  left_join(user_avgs, by='userId') %>% 
+  mutate(pred = mu + b_i + b_u) %>%
+  .$pred
+```
+These are the results of the aforementioned tests. Adding effects to the model improves the RMSE, however customizing a parameter lambda for movies and users separately did not seem to improve much the results, while increasing heavily the computation time to tune combinations of two parameters.
+```{r, echo = FALSE, include=FALSE}
+model_4_rmse <- RMSE(predicted_ratings, test_edx$rating)
+model_4_rmse
+```
+```{r, echo = FALSE, eval = TRUE}
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(method="Model 4: Different lambdas to Movie first then to User Effects",
+                                     RMSE = model_4_rmse ))
+
+rmse_results[10:12,] %>% knitr::kable()
+
+lambda_results <- bind_rows(lambda_results,
+                            data_frame(method = "Model 4: Lambda_i", Lambda = lambda_best[1]))
+lambda_results <- bind_rows(lambda_results,
+                            data_frame(method = "Model 4: Lambda_u", Lambda = lambda_best[2]))
+
+lambda_results %>% knitr::kable()
+
+#the model does not seem to improve the RMSE vs the single lambda test
+```
+Based on the above results, the next model attempt will accumulate a maximum number of effects, in order of stand-alone impact, and will be regularized by a single $\lambda$ parameter.
+
+# Final project model
+
+The following, and last model, which turns to be the best performing one, leverages on the learnings of the previous tests.
+
+## Development and choice justification
+
+"Model 5: Movie/User/Genre/Age/Hour/Day Effects regularized" incorporates a combination of effects (movie, user, genre, age, hour and weekday effects), and regularization via a parameter $\lambda$:
+$$ \hat{Y} = \mu + b_{i,\lambda} + b_{u,\lambda} + + b_{g,\lambda}+ b_{a,\lambda}+ b_{h,\lambda}+ b_{d,\lambda}$$
+
+Below is the code used to tune $\lambda$ for this model using cross-validation, and compare it to the previously developed models, to verify its performance in the test environment (no use of validation data yet).
+```{r, echo = TRUE, message = FALSE, fig.align='center',out.width = "75%", warning = FALSE}
+#MODEL 5 --> applying regularization to all effects calculated before
+
+l_min <- 4
+l_max <- 6
+l_steps <- 0.25
+
+rmse_matrix <- matrix(nrow=nb_folds,ncol=(l_max-l_min)/l_steps+1)
+lambdas <- seq(l_min, l_max, l_steps)
+
+for(k in 1:nb_folds) {
+  train_temp <- train_edx[cv_folds[[k]],]
+  test_temp <- train_edx[-cv_folds[[k]],]
+  
+  test_data <- test_temp %>% semi_join(train_temp, by = 'movieId') %>%
+    semi_join(train_temp, by = 'userId')
+  
+  removed <- anti_join(test_temp, test_data)
+  train_data <- rbind(train_temp, removed)
+  
+  mu <- mean(train_data$rating)
+  
+  rmse_matrix[k,] <- sapply(lambdas, function(l){
+    movie_avgs <- train_data %>% 
+      group_by(movieId) %>% 
+      summarize(b_i = sum(rating - mu)/(n()+l))
+    
+    user_avgs <- train_data %>% 
+      left_join(movie_avgs, by='movieId') %>%
+      group_by(userId) %>% 
+      summarize(b_u = sum(rating - mu - b_i)/(n()+l))
+    
+    genre_avgs <- train_data %>% 
+      left_join(movie_avgs, by='movieId') %>%
+      left_join(user_avgs, by='userId') %>%
+      group_by(genres) %>% 
+      summarize(b_g = sum(rating - mu - b_i - b_u)/(n()+l))
+    
+    age_avgs <- train_data %>% 
+      left_join(movie_avgs, by='movieId') %>%
+      left_join(user_avgs, by='userId') %>%
+      left_join(genre_avgs, by='genres') %>%
+      group_by(movie_age) %>% 
+      summarize(b_a = sum(rating - mu - b_i - b_u - b_g)/(n()+l))
+    
+    hour_avgs <- train_data %>% 
+      left_join(movie_avgs, by='movieId') %>%
+      left_join(user_avgs, by='userId') %>%
+      left_join(genre_avgs, by='genres') %>%
+      left_join(age_avgs, by='movie_age') %>%
+      group_by(hour) %>% 
+      summarize(b_h = sum(rating - mu - b_i - b_u - b_g - b_a)/(n()+l))
+    
+    weekday_avgs <- train_data %>% 
+      left_join(movie_avgs, by='movieId') %>%
+      left_join(user_avgs, by='userId') %>%
+      left_join(genre_avgs, by='genres') %>%
+      left_join(age_avgs, by='movie_age') %>%
+      left_join(hour_avgs, by='hour') %>%
+      group_by(weekday) %>% 
+      summarize(b_w = sum(rating - mu - b_i - b_u - b_g - b_a - b_h)/(n()+l))
+    
+    predicted_ratings <- test_data %>% 
+      left_join(user_avgs, by='userId') %>%
+      left_join(movie_avgs, by='movieId') %>%
+      left_join(genre_avgs, by='genres') %>%
+      left_join(age_avgs, by='movie_age') %>%
+      left_join(hour_avgs, by='hour') %>%
+      left_join(weekday_avgs, by='weekday') %>%
+      mutate(pred = mu + b_i + b_u + b_g + b_a + b_h + b_w) %>%
+      .$pred
+    
+    return(RMSE(predicted_ratings, test_data$rating))
+  })
+}
+
+rmses <- colMeans(rmse_matrix)
+
+lambda_best <- lambdas[which.min(rmses)]
+```
+The optimal $\lambda$ value for "Model 5" results in 4.75 (similar to "Model 3b"), the tuning phase is completed.
+```{r, echo = FALSE, message = FALSE, fig.align='center',out.width = "75%",warning = FALSE}
+qplot(lambdas, rmses)
+```
+With the calculated value for $\lambda$, let's use the "edx" train partition to compare this model to the previous.
+```{r, echo = TRUE, fig.align='center',out.width = "75%",message = FALSE, warning = FALSE}
+#build the model and test with edx test set
+
+mu <- mean(train_edx$rating)
+
+movie_avgs <- train_edx %>% 
+  group_by(movieId) %>% 
+  summarize(b_i = sum(rating - mu)/(n()+lambda_best))
+
+user_avgs <- train_edx %>% 
+  left_join(movie_avgs, by = 'movieId') %>%
+  group_by(userId) %>% 
+  summarize(b_u = sum(rating - b_i - mu)/(n()+lambda_best))
+
+genre_avgs <- train_edx %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  group_by(genres) %>% 
+  summarize(b_g = sum(rating - mu - b_i - b_u)/(n()+lambda_best))
+
+age_avgs <- train_edx %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  left_join(genre_avgs, by='genres') %>%
+  group_by(movie_age) %>% 
+  summarize(b_a = sum(rating - mu - b_i - b_u - b_g)/(n()+lambda_best))
+
+hour_avgs <- train_edx %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  left_join(genre_avgs, by='genres') %>%
+  left_join(age_avgs, by='movie_age') %>%
+  group_by(hour) %>% 
+  summarize(b_h = sum(rating - mu - b_i - b_u - b_g - b_a)/(n()+lambda_best))
+
+weekday_avgs <- train_edx %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  left_join(genre_avgs, by='genres') %>%
+  left_join(age_avgs, by='movie_age') %>%
+  left_join(hour_avgs, by='hour') %>%
+  group_by(weekday) %>% 
+  summarize(b_w = sum(rating - mu - b_i - b_u - b_g - b_a - b_h)/(n()+lambda_best))
+
+predicted_ratings <- test_edx %>% 
+  left_join(user_avgs, by='userId') %>%
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(genre_avgs, by='genres') %>%
+  left_join(age_avgs, by='movie_age') %>%
+  left_join(hour_avgs, by='hour') %>%
+  left_join(weekday_avgs, by='weekday') %>%
+  mutate(pred = mu + b_i + b_u + b_g + b_a + b_h + b_w) %>%
+  .$pred
+```
+```{r, echo = FALSE, message = FALSE, warning = FALSE}
+model_5_rmse <- RMSE(predicted_ratings, test_edx$rating)
+model_5_rmse
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(method="Model 5: Movie/User/Genre/Age/Hour/Day Effects regularized",
+                                     RMSE = model_5_rmse ))
+```
+The RMSE obtained with "Model 5" successfully beats all other previously tested models with 0.8651064.
+```{r, echo = FALSE, eval = TRUE}
+rmse_results[10:13,] %>% knitr::kable()
+
+lambda_results <- bind_rows(lambda_results,
+                            data_frame(method = "Model 5: Lambda_all", Lambda = lambda_best))
+
+lambda_results %>% knitr::kable()
+```
+```{r, echo = FALSE, fig.align='center',out.width = "75%",}
+rmse_results %>% ggplot(aes(x=reorder(method,RMSE), y=RMSE)) + 
+  geom_col() + coord_flip() + xlab("Method (by descending RMSE)")
+
+#model 5 technique will be our selection as it shows the best comparative performance
+lambda_final <- lambda_best
+```
+
+## Model creation and final hold-out test
+
+The last step consists on creating the final model with the entire "edx" set for better training, and then apply the model to the "validation" set to observe the final result on fresh unknown data.
+
+```{r, echo = FALSE}
+##########################################################
+# Aplying the selected model to the final validation test
+##########################################################
+
+```
+```{r, echo = TRUE}
+#building of the final model with the edx set and final lambda
+
+mu <- mean(edx$rating)
+
+movie_avgs <- edx %>% 
+  group_by(movieId) %>% 
+  summarize(b_i = sum(rating - mu)/(n()+lambda_final))
+
+user_avgs <- edx %>% 
+  left_join(movie_avgs, by = 'movieId') %>%
+  group_by(userId) %>% 
+  summarize(b_u = sum(rating - b_i - mu)/(n()+lambda_final))
+
+genre_avgs <- edx %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  group_by(genres) %>% 
+  summarize(b_g = sum(rating - mu - b_i - b_u)/(n()+lambda_final))
+
+age_avgs <- edx %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  left_join(genre_avgs, by='genres') %>%
+  group_by(movie_age) %>% 
+  summarize(b_a = sum(rating - mu - b_i - b_u - b_g)/(n()+lambda_final))
+
+hour_avgs <- edx %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  left_join(genre_avgs, by='genres') %>%
+  left_join(age_avgs, by='movie_age') %>%
+  group_by(hour) %>% 
+  summarize(b_h = sum(rating - mu - b_i - b_u - b_g - b_a)/(n()+lambda_final))
+
+weekday_avgs <- edx %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  left_join(genre_avgs, by='genres') %>%
+  left_join(age_avgs, by='movie_age') %>%
+  left_join(hour_avgs, by='hour') %>%
+  group_by(weekday) %>% 
+  summarize(b_w = sum(rating - mu - b_i - b_u - b_g - b_a - b_h)/(n()+lambda_final))
+
+predicted_ratings <- validation %>% 
+  left_join(user_avgs, by='userId') %>%
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(genre_avgs, by='genres') %>%
+  left_join(age_avgs, by='movie_age') %>%
+  left_join(hour_avgs, by='hour') %>%
+  left_join(weekday_avgs, by='weekday') %>%
+  mutate(pred = mu + b_i + b_u + b_g + b_a + b_h + b_w) %>%
+  .$pred
+
+model_final_rmse <- RMSE(predicted_ratings, validation$rating)
+model_final_rmse
+```
+The final RMSE obtained on the "validation" set with "Model 5" is \underline{0.8644685} (represented with a dashed line in the below summary plot) which is in fact even lower than the result for "Model 5" when evaluating on the "edx" test set for comparing across models.
+
+```{r, echo=FALSE, include=TRUE, fig.align='center',out.width = "75%",warning=FALSE,message=FALSE}
+rmse_results %>% ggplot(aes(x=reorder(method,RMSE), y=RMSE)) + 
+  geom_col() + coord_flip() + xlab("Method (by descending RMSE)") +
+  geom_hline(yintercept=model_final_rmse,linetype="dashed", color = "black", size = 1) +
+  geom_text(aes(0,model_final_rmse,label = round(model_final_rmse,4),vjust = -1.5, hjust = -0.1))
+
+```
+
+# Additional analysis: Matrix Factorization
+
+## About "recosystem" package
+
+As an additional exercise, a test has been performed using "recosystem" package. This easy-to-use package performs matrix factorization specifically for recommender systems, specifically for settings in which the matrix A has many missing values.
+
+The package provides a number of user-friendly R functions to simplify data processing and model building. Also, unlike most other R packages for statistical modeling, "recosystem" stores data in the hard disk rather than in memory achieving great performance.
+
+The aim of matrix factorization is to approximate the whole rating matrix $R_{m\,x\,n}$ by the product of two matrices of lower dimensions, $P_{k\,x\,m}$ and $Q_{k\,x\,n}$, such that:
+
+$$R{\approx}P{\prime}Q$$
+
+Then $p_u$ will be the $u$-th column of $P$, and $q_v$ be the $v$-th column of $Q$, then the rating given by user $u$ on item $v$ would be predicted as $p{\prime}_uq_v$, this will allow to fill the blanks in the ratings matrix.
+
+In order to fulfill this task, the algorithm will iterate to find the best approximation for $P$ and $Q$.
+
+Full detail and examples of "recosystem" package can be found in:
+https://cran.r-project.org/web/packages/recosystem/recosystem.pdf
+
+## Applying Matrix Factorization
+
+Following the same analysis workflow to train the model on "edx" train partition and evaluate on "edx" test dataset, after executing the following code an RMSE of 0.7863502 already shows big improvement compared to regression techniques.
+
+```{r, include = FALSE}
+##########################################################
+# Matrix Factorization approach with recosystem
+##########################################################
+
+#adapt our train and test data to recosystem input format
+train_data <-  with(train_edx, data_memory(user_index = userId, 
+                                           item_index = movieId, 
+                                           rating     = rating))
+test_data  <-  with(test_edx,  data_memory(user_index = userId, 
+                                           item_index = movieId, 
+                                           rating     = rating))
+
+#create model object
+r <-  recosystem::Reco()
+
+#define tuning parameters and train the algorithm
+opts <- r$tune(train_data, opts = list(dim = c(10, 20, 30), 
+                                       lrate = c(0.1, 0.2),
+                                       costp_l2 = c(0.01, 0.1), 
+                                       costq_l2 = c(0.01, 0.1),
+                                       nthread  = 4, niter = 10))
+
+r$train(train_data, opts = c(opts$min, nthread = 4, niter = 20))
+
+#calculate the predicted ratings 
+predicted_ratings <-  r$predict(test_data, out_memory())
+```
+```{r, echo = FALSE,eval=TRUE, message = FALSE, fig.align='center',out.width = "75%", warning = FALSE}
+model_MF_rmse <- RMSE(predicted_ratings, test_edx$rating)
+
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(method="Matrix Factorization with recosystem package",
+                                     RMSE = model_MF_rmse ))
+
+rmse_results %>% knitr::kable()
+
+#after a lengthy processing, the RMSE is improving greatly with this technique
+```
+For simplification purposes here's the code to prepare data in a friendly format for "recosystem" package and create the model on the entire "edx" set to later evaluate the final results on the "validation set" as previously done.
+
+```{r, echo = TRUE, results = 'hide'}
+#building the model on the edx entire set
+
+edx_data <-  with(edx, data_memory(user_index = userId, 
+                                   item_index = movieId, 
+                                   rating = rating))
+validation_data  <-  with(validation, data_memory(user_index = userId, 
+                                                  item_index = movieId, 
+                                                  rating = rating))
+r <-  recosystem::Reco()
+
+opts <-  r$tune(edx_data, opts = list(dim = c(10, 20, 30), 
+                                      lrate = c(0.1, 0.2),
+                                      costp_l2 = c(0.01, 0.1), 
+                                      costq_l2 = c(0.01, 0.1),
+                                      nthread  = 4, niter = 10))
+
+r$train(edx_data, opts = c(opts$min, nthread = 4, niter = 20))
+
+#applying the model to the validation data set
+```
+```{r, echo = TRUE, message = FALSE, fig.align='center',out.width = "75%", warning = FALSE}
+predicted_ratings <-  r$predict(validation_data, out_memory())
+
+model_finalMF_rmse <- RMSE(predicted_ratings, validation$rating)
+model_finalMF_rmse
+```
+```{r, echo=FALSE, include=TRUE, fig.align='center',out.width = "75%",warning=FALSE,message=FALSE}
+rmse_results %>% ggplot(aes(x=reorder(method,RMSE), y=RMSE)) + 
+  geom_col() + coord_flip() + xlab("Method (by descending RMSE)") +
+  geom_hline(yintercept=model_finalMF_rmse,linetype="dotted", color = "black", size = 1) +  
+  geom_text(aes(0,model_finalMF_rmse,label = round(model_finalMF_rmse,4),vjust = -1.5, hjust = -0.1))
+
+```
+The RMSE results in 0.7822679 (illustrated with a dotted line) considerably beating the previous techniques, and even the result of "Model 5".
+
+# Final conclusions
+
+With simple regression techniques improved by regularisation, the project target has been achieved.
+
+In practical effects, the addition of some extra effects might not be of use if the prediction exercise has to be ran on a daily or weekly basis, as opposed of it being "real-time".
+
+Additionally, as suggested by the course literature on the "Netflix" challenge experience, other techniques such as matrix factorization can radically improve the results of the exercise, but comes at expenses of long calculation times.
+
+Further ideas to explore can leverage on $knn$ techniques to apply movie recommendation ratings on similar users, or also developing derivated predictors based on more mutations of the original data.
